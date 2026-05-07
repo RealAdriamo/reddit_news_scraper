@@ -5,17 +5,20 @@ import plotly.express as px
 import requests
 import streamlit as st
 
+from bs4 import BeautifulSoup
+
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 
-st.set_page_config(
-    page_title="Reddit r/news Articles",
-    layout="wide"
-)
+st.set_page_config(page_title="Reddit r/news Articles", layout="wide")
 
 HEADERS = {
-    "User-Agent": "streamlit:reddit-news-app:v1.0 (by /u/example)"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
 }
 
 STOPWORDS = {
@@ -27,9 +30,17 @@ STOPWORDS = {
     "you", "your", "our", "we", "but", "who", "what", "when", "why", "how",
     "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
     "man", "woman", "person", "people", "company", "companies", "group", "groups",
-    "news", "article", "articles", "story", "stories", "report", "reports",
-    "found", "he", "she", "it", "they", "us", "them", "their", "my", "our",
-    "we", "said"
+    "news", "article", "articles", "story", "stories", "report", "reports", "found",
+    "he", "she", "it", "they", "us", "they", "them", "their", "my", "our", "we",
+    "said"
+}
+
+FILTER_PATHS = {
+    "hot": "",
+    "new": "new/",
+    "rising": "rising/",
+    "controversial": "controversial/",
+    "top": "top/",
 }
 
 TIME_MAP = {
@@ -83,87 +94,145 @@ CENTER_TERMS = {
 }
 
 
+def normalize_url(url):
+    if not url:
+        return None
+
+    if url.startswith("//"):
+        return "https:" + url
+
+    if url.startswith("/"):
+        return "https://old.reddit.com" + url
+
+    return url
+
+
 def build_start_url(feed_type, timeframe):
-    base = "https://www.reddit.com/r/news"
+    base = "https://old.reddit.com/r/news/"
+    path = FILTER_PATHS.get(feed_type, "")
 
-    if feed_type == "hot":
-        return f"{base}/hot.json?limit=25"
+    if feed_type in {"top", "controversial"} and timeframe:
+        t = TIME_MAP[timeframe]
+        return f"{base}{path}?sort={feed_type}&t={t}"
 
-    if feed_type == "new":
-        return f"{base}/new.json?limit=25"
+    return f"{base}{path}"
 
-    if feed_type == "rising":
-        return f"{base}/rising.json?limit=25"
 
-    if feed_type == "top":
-        t = TIME_MAP.get(timeframe, "day")
-        return f"{base}/top.json?t={t}&limit=25"
+def parse_score(text):
+    if not text:
+        return None
 
-    if feed_type == "controversial":
-        t = TIME_MAP.get(timeframe, "day")
-        return f"{base}/controversial.json?t={t}&limit=25"
+    text = text.strip().lower().replace(",", "")
 
-    return f"{base}/hot.json?limit=25"
+    if text in {"•", "score hidden"}:
+        return None
+
+    try:
+        if text.endswith("k"):
+            return int(float(text[:-1]) * 1000)
+
+        return int(text)
+
+    except ValueError:
+        match = re.search(r"(\d+(?:\.\d+)?)", text)
+
+        if match:
+            value = float(match.group(1))
+
+            if "k" in text:
+                return int(value * 1000)
+
+            return int(value)
+
+        return None
+
+
+def parse_comments(text):
+    if not text:
+        return None
+
+    text = text.strip().lower().replace(",", "")
+
+    if "comment" not in text:
+        return None
+
+    match = re.search(r"(\d+)", text)
+
+    if match:
+        return int(match.group(1))
+
+    return 0
 
 
 def scrape_page(url, page_num):
-    response = requests.get(
-        url,
-        headers=HEADERS,
-        timeout=30
-    )
+    response = requests.get(url, headers=HEADERS, timeout=20)
 
-    if response.status_code != 200:
-        st.error(f"Reddit returned status code {response.status_code}")
-        return [], None
-
-    data = response.json()
+    soup = BeautifulSoup(response.text, "html.parser")
 
     records = []
 
-    children = data.get("data", {}).get("children", [])
+    posts = soup.select("div.thing")
 
-    for post in children:
-        p = post.get("data", {})
+    for post in posts:
+        title_tag = post.select_one("p.title a.title")
+        score_tag = post.select_one("div.score.unvoted")
+        comments_tag = post.select_one("a.bylink.comments")
+        time_tag = post.select_one("p.tagline time.live-timestamp")
 
-        permalink = p.get("permalink", "")
+        title = title_tag.get_text(strip=True) if title_tag else None
+
+        post_url = (
+            normalize_url(title_tag.get("href"))
+            if title_tag else None
+        )
+
+        score_text = ""
+
+        if score_tag:
+            score_text = (
+                score_tag.get("title")
+                or score_tag.get_text(strip=True)
+            )
+
+        comments_text = (
+            comments_tag.get_text(" ", strip=True)
+            if comments_tag else ""
+        )
 
         records.append(
             {
-                "Title": p.get("title"),
-                "Score": p.get("score"),
-                "Comments": p.get("num_comments"),
-                "Post URL": f"https://reddit.com{permalink}",
-                "Comments URL": f"https://reddit.com{permalink}",
-                "Posted": None,
-                "Posted Datetime": pd.to_datetime(
-                    p.get("created_utc"),
-                    unit="s",
-                    errors="coerce"
+                "Title": title,
+                "Score": parse_score(score_text),
+                "Comments": parse_comments(comments_text),
+                "Post URL": post_url,
+                "Comments URL": (
+                    normalize_url(comments_tag.get("href"))
+                    if comments_tag else None
+                ),
+                "Posted": (
+                    time_tag.get_text(strip=True)
+                    if time_tag else None
+                ),
+                "Posted Datetime": (
+                    time_tag.get("datetime")
+                    if time_tag else None
                 ),
                 "Page": page_num,
             }
         )
 
-    after = data.get("data", {}).get("after")
+    next_tag = soup.select_one("span.next-button a")
 
-    next_url = None
-
-    if after:
-        if "&after=" in url:
-            next_url = re.sub(
-                r"after=[^&]+",
-                f"after={after}",
-                url
-            )
-        else:
-            next_url = f"{url}&after={after}"
+    next_url = (
+        normalize_url(next_tag.get("href"))
+        if next_tag else None
+    )
 
     return records, next_url
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def scrape_news(num_pages=5, feed_type="hot", timeframe=None):
+def scrape_news(num_pages=10, feed_type="hot", timeframe=None):
     url = build_start_url(feed_type, timeframe)
 
     all_records = []
@@ -173,8 +242,7 @@ def scrape_news(num_pages=5, feed_type="hot", timeframe=None):
         try:
             records, next_url = scrape_page(url, page_num)
 
-        except Exception as e:
-            st.error(f"Scraping failed: {e}")
+        except Exception:
             break
 
         all_records.extend(records)
@@ -446,7 +514,7 @@ with st.sidebar:
         "Pages to scrape",
         min_value=1,
         max_value=10,
-        value=5,
+        value=10,
         step=1
     )
 
@@ -484,8 +552,6 @@ df = scrape_news(
     feed_type,
     timeframe
 )
-
-st.write(df.head())
 
 if df.empty:
     st.error("No data was scraped.")
@@ -645,6 +711,17 @@ if "Posted Datetime" in show_df.columns:
         .replace("NaT", "")
     )
 
+if "Comments URL" in show_df.columns:
+    show_df["Comments URL"] = (
+        show_df["Comments URL"]
+        .astype("string")
+        .str.replace(
+            "https://old.reddit.com",
+            "https://www.reddit.com",
+            regex=False
+        )
+    )
+
 st.dataframe(
     show_df,
     use_container_width=True,
@@ -697,6 +774,9 @@ with left:
             use_container_width=True
         )
 
+    else:
+        st.info("No rows to plot.")
+
 with right:
     st.subheader("Upvotes vs comments")
 
@@ -721,6 +801,9 @@ with right:
             fig,
             use_container_width=True
         )
+
+    else:
+        st.info("No rows to plot.")
 
 left2, right2 = st.columns(2)
 
@@ -752,6 +835,9 @@ with left2:
             fig,
             use_container_width=True
         )
+
+    else:
+        st.info("No words to plot.")
 
 with right2:
     st.subheader("Average comments by page")
@@ -788,6 +874,9 @@ with right2:
             use_container_width=True
         )
 
+    else:
+        st.info("No rows to plot.")
+
 left3, right3 = st.columns(2)
 
 with left3:
@@ -810,12 +899,18 @@ with left3:
             x="Sentiment",
             y="Count",
             title="Headline sentiment distribution",
+            labels={
+                "Count": "Number of posts"
+            },
         )
 
         st.plotly_chart(
             fig,
             use_container_width=True
         )
+
+    else:
+        st.info("No sentiment data to plot.")
 
 with right3:
     st.subheader("Political leaning distribution")
@@ -837,6 +932,9 @@ with right3:
             x="Political Leaning",
             y="Count",
             title="Estimated political leaning distribution",
+            labels={
+                "Count": "Number of posts"
+            },
         )
 
         st.plotly_chart(
@@ -844,14 +942,87 @@ with right3:
             use_container_width=True
         )
 
+    else:
+        st.info("No leaning data to plot.")
+
+left4, right4 = st.columns(2)
+
+with left4:
+    st.subheader("Average engagement by sentiment")
+
+    sentiment_engagement = (
+        filtered_df
+        .dropna(subset=["Score", "Comments"])
+        .groupby("Sentiment")[["Score", "Comments"]]
+        .mean()
+        .reset_index()
+    )
+
+    if len(sentiment_engagement):
+        fig = px.bar(
+            sentiment_engagement,
+            x="Sentiment",
+            y=["Score", "Comments"],
+            barmode="group",
+            title="Average engagement by sentiment",
+            labels={
+                "value": "Average",
+                "variable": "Metric"
+            },
+        )
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True
+        )
+
+    else:
+        st.info("No sentiment engagement data to plot.")
+
+with right4:
+    st.subheader("Average engagement by leaning")
+
+    leaning_engagement = (
+        filtered_df
+        .dropna(subset=["Score", "Comments"])
+        .groupby("Political Leaning")[["Score", "Comments"]]
+        .mean()
+        .reset_index()
+    )
+
+    if len(leaning_engagement):
+        fig = px.bar(
+            leaning_engagement,
+            x="Political Leaning",
+            y=["Score", "Comments"],
+            barmode="group",
+            title="Average engagement by estimated leaning",
+            labels={
+                "value": "Average",
+                "variable": "Metric"
+            },
+        )
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True
+        )
+
+    else:
+        st.info("No leaning engagement data to plot.")
+
 st.subheader("Comment prediction model")
 
 model, metrics, prediction_df = (
     train_comment_prediction_model(filtered_df)
 )
 
-if model is not None:
+if model is None:
+    st.info(
+        "Not enough clean data to train a prediction model."
+    )
 
+else:
     p1, p2 = st.columns(2)
 
     p1.metric(

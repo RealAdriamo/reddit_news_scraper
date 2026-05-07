@@ -5,6 +5,8 @@ import plotly.express as px
 import requests
 import streamlit as st
 
+from bs4 import BeautifulSoup
+
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
@@ -12,7 +14,11 @@ from sklearn.metrics import mean_absolute_error, r2_score
 st.set_page_config(page_title="Reddit r/news Articles", layout="wide")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
 }
 
 STOPWORDS = {
@@ -102,7 +108,7 @@ def normalize_url(url):
 
 
 def build_start_url(feed_type, timeframe):
-    base = "https://reddit.com/r/news/"
+    base = "https://old.reddit.com/r/news/"
     path = FILTER_PATHS.get(feed_type, "")
 
     if feed_type in {"top", "controversial"} and timeframe:
@@ -159,51 +165,68 @@ def parse_comments(text):
 
 
 def scrape_page(url, page_num):
-    json_url = url.rstrip("/") + ".json?limit=25"
+    response = requests.get(url, headers=HEADERS, timeout=20)
 
-    response = requests.get(
-        json_url,
-        headers=HEADERS,
-        timeout=20
-    )
-
-    data = response.json()
+    soup = BeautifulSoup(response.text, "html.parser")
 
     records = []
 
-    posts = data["data"]["children"]
+    posts = soup.select("div.thing")
 
     for post in posts:
-        p = post["data"]
+        title_tag = post.select_one("p.title a.title")
+        score_tag = post.select_one("div.score.unvoted")
+        comments_tag = post.select_one("a.bylink.comments")
+        time_tag = post.select_one("p.tagline time.live-timestamp")
+
+        title = title_tag.get_text(strip=True) if title_tag else None
+
+        post_url = (
+            normalize_url(title_tag.get("href"))
+            if title_tag else None
+        )
+
+        score_text = ""
+
+        if score_tag:
+            score_text = (
+                score_tag.get("title")
+                or score_tag.get_text(strip=True)
+            )
+
+        comments_text = (
+            comments_tag.get_text(" ", strip=True)
+            if comments_tag else ""
+        )
 
         records.append(
             {
-                "Title": p.get("title"),
-                "Score": p.get("score"),
-                "Comments": p.get("num_comments"),
-                "Post URL": (
-                    "https://reddit.com" + p.get("permalink", "")
-                ),
+                "Title": title,
+                "Score": parse_score(score_text),
+                "Comments": parse_comments(comments_text),
+                "Post URL": post_url,
                 "Comments URL": (
-                    "https://reddit.com" + p.get("permalink", "")
+                    normalize_url(comments_tag.get("href"))
+                    if comments_tag else None
                 ),
-                "Posted": None,
-                "Posted Datetime": pd.to_datetime(
-                    p.get("created_utc"),
-                    unit="s",
-                    errors="coerce"
+                "Posted": (
+                    time_tag.get_text(strip=True)
+                    if time_tag else None
+                ),
+                "Posted Datetime": (
+                    time_tag.get("datetime")
+                    if time_tag else None
                 ),
                 "Page": page_num,
             }
         )
 
-    after = data["data"].get("after")
+    next_tag = soup.select_one("span.next-button a")
 
-    next_url = None
-
-    if after:
-        separator = "&" if "?" in url else "?"
-        next_url = f"{url}{separator}after={after}"
+    next_url = (
+        normalize_url(next_tag.get("href"))
+        if next_tag else None
+    )
 
     return records, next_url
 

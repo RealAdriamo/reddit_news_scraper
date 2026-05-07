@@ -94,165 +94,74 @@ CENTER_TERMS = {
 }
 
 
-def normalize_url(url):
-    if not url:
-        return None
+@st.cache_data(ttl=900, show_spinner=False)
+def scrape_news(num_pages=5, feed_type="hot", timeframe=None):
 
-    if url.startswith("//"):
-        return "https:" + url
+    headers = {
+        "User-Agent": "realadriamo-news-dashboard/1.0"
+    }
 
-    if url.startswith("/"):
-        return "https://old.reddit.com" + url
-
-    return url
-
-
-def build_start_url(feed_type, timeframe):
-    base = "https://old.reddit.com/r/news/"
-    path = FILTER_PATHS.get(feed_type, "")
-
-    if feed_type in {"top", "controversial"} and timeframe:
-        t = TIME_MAP[timeframe]
-        return f"{base}{path}?sort={feed_type}&t={t}"
-
-    return f"{base}{path}"
-
-
-def parse_score(text):
-    if not text:
-        return None
-
-    text = text.strip().lower().replace(",", "")
-
-    if text in {"•", "score hidden"}:
-        return None
-
-    try:
-        if text.endswith("k"):
-            return int(float(text[:-1]) * 1000)
-
-        return int(text)
-
-    except ValueError:
-        match = re.search(r"(\d+(?:\.\d+)?)", text)
-
-        if match:
-            value = float(match.group(1))
-
-            if "k" in text:
-                return int(value * 1000)
-
-            return int(value)
-
-        return None
-
-
-def parse_comments(text):
-    if not text:
-        return None
-
-    text = text.strip().lower().replace(",", "")
-
-    if "comment" not in text:
-        return None
-
-    match = re.search(r"(\d+)", text)
-
-    if match:
-        return int(match.group(1))
-
-    return 0
-
-
-def scrape_page(url, page_num):
-    response = requests.get(url, headers=HEADERS, timeout=20)
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
+    after = None
     records = []
 
-    posts = soup.select("div.thing")
+    for _ in range(num_pages):
 
-    for post in posts:
-        title_tag = post.select_one("p.title a.title")
-        score_tag = post.select_one("div.score.unvoted")
-        comments_tag = post.select_one("a.bylink.comments")
-        time_tag = post.select_one("p.tagline time.live-timestamp")
+        if feed_type in {"top", "controversial"}:
+            url = f"https://www.reddit.com/r/news/{feed_type}.json?limit=100&t={TIME_MAP[timeframe]}"
+        else:
+            url = f"https://www.reddit.com/r/news/{feed_type}.json?limit=100"
 
-        title = title_tag.get_text(strip=True) if title_tag else None
-
-        post_url = (
-            normalize_url(title_tag.get("href"))
-            if title_tag else None
-        )
-
-        score_text = ""
-
-        if score_tag:
-            score_text = (
-                score_tag.get("title")
-                or score_tag.get_text(strip=True)
-            )
-
-        comments_text = (
-            comments_tag.get_text(" ", strip=True)
-            if comments_tag else ""
-        )
-
-        records.append(
-            {
-                "Title": title,
-                "Score": parse_score(score_text),
-                "Comments": parse_comments(comments_text),
-                "Post URL": post_url,
-                "Comments URL": (
-                    normalize_url(comments_tag.get("href"))
-                    if comments_tag else None
-                ),
-                "Posted": (
-                    time_tag.get_text(strip=True)
-                    if time_tag else None
-                ),
-                "Posted Datetime": (
-                    time_tag.get("datetime")
-                    if time_tag else None
-                ),
-                "Page": page_num,
-            }
-        )
-
-    next_tag = soup.select_one("span.next-button a")
-
-    next_url = (
-        normalize_url(next_tag.get("href"))
-        if next_tag else None
-    )
-
-    return records, next_url
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def scrape_news(num_pages=10, feed_type="hot", timeframe=None):
-    url = build_start_url(feed_type, timeframe)
-
-    all_records = []
-
-    for page_num in range(1, num_pages + 1):
+        if after:
+            url += f"&after={after}"
 
         try:
-            records, next_url = scrape_page(url, page_num)
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=20
+            )
+
+            data = response.json()
 
         except Exception:
             break
 
-        all_records.extend(records)
+        posts = data["data"]["children"]
 
-        if not next_url:
+        if not posts:
             break
 
-        url = next_url
+        for post in posts:
 
-    df = pd.DataFrame(all_records)
+            p = post["data"]
+
+            records.append(
+                {
+                    "Title": p.get("title"),
+                    "Score": p.get("score"),
+                    "Comments": p.get("num_comments"),
+                    "Post URL": (
+                        "https://reddit.com" + p.get("permalink", "")
+                    ),
+                    "Comments URL": (
+                        "https://reddit.com" + p.get("permalink", "")
+                    ),
+                    "Posted": None,
+                    "Posted Datetime": pd.to_datetime(
+                        p.get("created_utc"),
+                        unit="s",
+                        errors="coerce"
+                    ),
+                    "Page": _ + 1,
+                }
+            )
+
+        after = data["data"].get("after")
+
+        if not after:
+            break
+
+    df = pd.DataFrame(records)
 
     if df.empty:
         return pd.DataFrame(
@@ -268,25 +177,20 @@ def scrape_news(num_pages=10, feed_type="hot", timeframe=None):
             ]
         )
 
-    df["Score"] = (
-        pd.to_numeric(df["Score"], errors="coerce")
-        .astype("Int64")
-    )
-
-    df["Comments"] = (
-        pd.to_numeric(df["Comments"], errors="coerce")
-        .astype("Int64")
-    )
-
-    df["Page"] = (
-        pd.to_numeric(df["Page"], errors="coerce")
-        .astype("Int64")
-    )
-
-    df["Posted Datetime"] = pd.to_datetime(
-        df["Posted Datetime"],
+    df["Score"] = pd.to_numeric(
+        df["Score"],
         errors="coerce"
-    )
+    ).astype("Int64")
+
+    df["Comments"] = pd.to_numeric(
+        df["Comments"],
+        errors="coerce"
+    ).astype("Int64")
+
+    df["Page"] = pd.to_numeric(
+        df["Page"],
+        errors="coerce"
+    ).astype("Int64")
 
     df = (
         df.drop_duplicates(subset=["Title", "Post URL"])
@@ -294,7 +198,6 @@ def scrape_news(num_pages=10, feed_type="hot", timeframe=None):
     )
 
     return df
-
 
 def filter_dataframe(df, keyword, min_score, min_comments):
     filtered = df.copy()
